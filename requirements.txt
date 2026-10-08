@@ -1,0 +1,17 @@
+# -*- coding: utf-8 -*-
+# 作业要求：提交 Python 代码时需附 requirements.txt
+# 版本号按 2025-11 环境实测可用的最低版本约束，避免"我这儿能跑"
+
+requests>=2.31.0          # HTTP 客户端（爬虫基础）
+jieba>=0.42.1             # 中文分词
+pandas>=2.0.0             # 统计聚合与 Excel 写出
+openpyxl>=3.1.0           # xlsx 引擎
+matplotlib>=3.8.0         # 静态图表
+wordcloud>=1.9.2          # 词云生成
+pyecharts>=2.0.0          # 可视化大屏（附加题）
+numpy>=1.26.0             # 词云蒙版与数值计算
+Pillow>=10.0.0            # 图片读写
+
+# ---- 开发/测试依赖 ----
+pytest>=8.0.0             # 单元测试框架
+pytest-cov>=5.0.0         # 测试覆盖率统计（作业要求查看分支覆盖率）

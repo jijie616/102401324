@@ -1,0 +1,20 @@
+# 项目元信息（可选安装：pip install -e .）
+# 注意：flake8 / pylint 的配置分别放在 .flake8 与 .pylintrc，
+# 它们不读取 pyproject.toml 的 [tool.*] 表。
+
+[project]
+name = "llm-danmaku"
+version = "1.0.0"
+description = "B站大语言模型相关视频弹幕分析挖掘（2025软工K班个人编程任务）"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+package-dir = { "" = "src" }
+
+[tool.setuptools.packages.find]
+where = ["src"]

@@ -1,0 +1,17 @@
+[MASTER]
+ignore = .git, __pycache__, .venv, venv
+jobs = 0
+
+[FORMAT]
+max-line-length = 100
+
+[MESSAGES CONTROL]
+# C0114/C0115/C0116 缺少模块/类/函数 docstring：本项目已全量编写，若误报可开启
+# R0913/R0914/R0917 参数与局部变量过多：数据类与统计函数天然参数较多
+# W0718 捕获过于宽泛的 Exception：爬虫必须做失败隔离，属有意设计
+disable = R0913, R0914, R0917, W0718
+
+[DESIGN]
+max-args = 10
+max-locals = 25
+max-attributes = 15

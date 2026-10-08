@@ -1,0 +1,61 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ---- 虚拟环境 ----
+.venv/
+venv/
+ENV/
+env/
+
+# ---- 测试与覆盖率 ----
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+.tox/
+.nox/
+
+# ---- IDE ----
+.vscode/*
+!.vscode/settings.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# ---- 项目运行产物 ----
+logs/
+output/
+
+# 原始弹幕缓存体积大（300 个视频可达数百 MB），不入库；删除后重跑会自动重抓
+data/raw/
+data/cleaned_by_video/
+data/danmaku_cleaned.jsonl
+
+# 保留体积很小的可复现数据源：视频清单、媒体文章、arXiv 论文样本
+!data/videos.json
+!data/media_articles.jsonl
+!data/arxiv_papers.jsonl
+
+# ---- 系统 ----
+.DS_Store
+Thumbs.db
+desktop.ini
