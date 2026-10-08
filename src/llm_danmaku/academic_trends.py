@@ -231,12 +231,20 @@ def build_report(monthly_totals: Dict[str, int], papers: Sequence[Paper]) -> Dic
         )
     months_sorted = sorted(monthly_totals)
     if len(months_sorted) >= 2:
-        first, last = monthly_totals[months_sorted[0]], monthly_totals[months_sorted[-1]]
-        if first:
-            conclusions.append(
-                f"投稿总量从 {months_sorted[0]} 的 {first} 篇增长到 {months_sorted[-1]} 的 {last} 篇"
-                f"（{(last - first) / first * 100:+.1f}%），说明该领域整体仍在快速扩张。"
-            )
+        # 数据完整性保护：当前月尚未结束，其投稿量天然偏低，
+        # 直接与完整月份比较会得出"下降 90%"这类错误结论。
+        # 因此用于趋势对比时一律跳过"最新（可能不完整）的那个月"。
+        comparable = months_sorted[:-1]
+        if len(comparable) >= 2:
+            first_month, last_month = comparable[0], comparable[-1]
+            first, last = monthly_totals[first_month], monthly_totals[last_month]
+            if first:
+                delta = (last - first) / first * 100
+                conclusions.append(
+                    f"投稿总量从 {first_month} 的 {first} 篇增长到 {last_month} 的 {last} 篇"
+                    f"（{delta:+.1f}%），说明该领域整体仍在快速扩张。"
+                    "（注：最新月份尚未结束、数据不完整，已排除在对比之外。）"
+                )
     conclusions.append(
         "综合媒体观点与学术前沿：未来 1-2 年大语言模型的应用将集中在"
         "智能体化工作流、成本可控的推理部署、以及可验证的安全合规三条主线上，"
