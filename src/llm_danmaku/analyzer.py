@@ -109,13 +109,19 @@ class DanmakuStats:
         data = asdict(self)
         return data
 
-    def save(self, path: Path = config.STATS_FILE) -> Path:
-        """把统计结果写入 JSON，供可视化与博客引用。"""
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w", encoding="utf-8") as fh:
+    def save(self, path: Optional[Path] = None) -> Path:
+        """把统计结果写入 JSON，供可视化与博客引用。
+
+        注意：默认参数不能写成 ``path=config.STATS_FILE``——Python 的默认值在
+        **函数定义时**求值，那样会把路径固定死，导致运行期修改配置不生效
+        （也让单元测试无法重定向输出目录）。因此这里用 None 哨兵，在函数体内取。
+        """
+        target = Path(path) if path is not None else config.STATS_FILE
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with open(target, "w", encoding="utf-8") as fh:
             json.dump(self.as_dict(), fh, ensure_ascii=False, indent=2)
-        logger.info("统计结果已写入 %s", path)
-        return Path(path)
+        logger.info("统计结果已写入 %s", target)
+        return target
 
     # ------------------------------------------------------------ 派生指标
     @property

@@ -24,12 +24,13 @@ def _page(title: str):
     return page
 
 
-def build_dashboard(stats: DanmakuStats, path: Path = config.DASHBOARD_FILE) -> Optional[Path]:
+def build_dashboard(stats: DanmakuStats, path: Optional[Path] = None) -> Optional[Path]:
     """生成可视化大屏 HTML。
 
     Args:
         stats: 统计结果。
-        path: 输出 HTML 路径。
+        path: 输出 HTML 路径；为 None 时用 config.DASHBOARD_FILE
+            （在函数体内取，避免默认参数在定义时求值）。
 
     Returns:
         成功返回路径；pyecharts 缺失时返回 None（不影响主流程）。
@@ -166,7 +167,7 @@ def build_dashboard(stats: DanmakuStats, path: Path = config.DASHBOARD_FILE) -> 
         return None
 
     # ---------- 7. 顶部关键指标（用 Page 的 HTML 头部承载） ----------
-    out = Path(path)
+    out = Path(path) if path is not None else config.DASHBOARD_FILE
     out.parent.mkdir(parents=True, exist_ok=True)
     page = _page("B站大语言模型弹幕分析大屏")
     page.add(*charts)

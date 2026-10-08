@@ -83,9 +83,15 @@ def timeit(func: Callable[[], object], name: str = "") -> Tuple[object, Timing]:
     return result, Timing(name or getattr(func, "__name__", "func"), time.perf_counter() - start)
 
 
-def profile_pipeline(texts: Sequence[str], out_dir: Path = config.PROFILE_DIR,
+def profile_pipeline(texts: Sequence[str], out_dir: Optional[Path] = None,
                      top_n: int = 15) -> Tuple[Path, List[Tuple[str, float]]]:
     """对"清洗 -> 分词 -> 统计"这条数据统计链路做 cProfile 分析。
+
+    Args:
+        texts: 待分析的弹幕文本。
+        out_dir: 报告输出目录；为 None 时用 config.PROFILE_DIR
+            （在函数体内取，避免默认参数在定义时求值）。
+        top_n: 报告里展示的 Top 函数数量。
 
     Returns:
         (报告路径, [(函数名, 累计耗时秒)])  —— 后者用于画柱状图。
@@ -94,7 +100,7 @@ def profile_pipeline(texts: Sequence[str], out_dir: Path = config.PROFILE_DIR,
     from .cleaner import clean_batch
     from .danmaku_crawler import CrawlResult, Danmaku
 
-    out_dir = Path(out_dir)
+    out_dir = Path(out_dir) if out_dir is not None else config.PROFILE_DIR
     out_dir.mkdir(parents=True, exist_ok=True)
 
     def workload() -> Counter:

@@ -67,17 +67,18 @@ def _align():
     return Alignment(horizontal="center", vertical="center")
 
 
-def export_to_excel(stats: DanmakuStats, path: Path = config.EXCEL_FILE) -> Path:
+def export_to_excel(stats: DanmakuStats, path: Optional[Path] = None) -> Path:
     """把统计结果导出为 xlsx。
 
     Args:
         stats: analyze() 的返回值。
-        path: 输出路径。
+        path: 输出路径；为 None 时用 config.EXCEL_FILE（在函数体内取，
+            避免默认参数在定义时求值导致配置无法覆盖）。
 
     Returns:
         实际写入的文件路径。
     """
-    out = Path(path)
+    out = Path(path) if path is not None else config.EXCEL_FILE
     out.parent.mkdir(parents=True, exist_ok=True)
 
     overview: List[Tuple[str, object]] = [
@@ -152,11 +153,11 @@ def export_to_excel(stats: DanmakuStats, path: Path = config.EXCEL_FILE) -> Path
     return out
 
 
-def export_videos_json(videos: Sequence[object], path: Path = config.VIDEO_LIST_FILE) -> Path:
+def export_videos_json(videos: Sequence[object], path: Optional[Path] = None) -> Path:
     """把视频列表写入 JSON（爬虫中间产物，便于复现）。"""
     import json
 
-    out = Path(path)
+    out = Path(path) if path is not None else config.VIDEO_LIST_FILE
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = [v.as_dict() if hasattr(v, "as_dict") else v for v in videos]
     with open(out, "w", encoding="utf-8") as fh:
