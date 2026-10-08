@@ -401,7 +401,7 @@ class DanmakuCrawler:
                 # 多分P 的 progress 是"分P 内偏移"，直接统计会让所有分P 的
                 # 弹幕都堆在 0-10% 桶里。这里按分P 时长做偏移归一化，
                 # 换算成"在整部视频中的相对位置"，时间轴统计才有意义。
-                page_duration = self._page_duration(cids, idx)
+                page_duration = self._page_duration(video.bvid, idx)
                 if page_duration:
                     total_duration += page_duration
                     for dm in batch:

@@ -170,28 +170,32 @@ class BiliClient:
         这是**全局**节流（跨线程共享），因此把并发调高也不会突破总速率上限。
         实测：无节流时 6 线程短时间打出数千请求会触发 B 站突发限流，
         接口连续失败直至冷却；加入全局节流后可持续稳定抓取。
+
+        实现要点：**计算等待时长在锁内，实际 sleep 必须在锁外**。
+        若在持锁期间 sleep，所有工作线程都会排队等这把锁，
+        并发就退化成串行（本项目早期版本正是踩了这个坑）。
         """
         with self._lock:
             now = time.monotonic()
             wait = self._min_interval - (now - self._last_request_ts)
-            if wait > 0:
-                time.sleep(wait)
-            self._last_request_ts = time.monotonic()
+            # 先占位再出锁睡眠：把自己的时间片预留下来，避免其他线程同时通过
+            self._last_request_ts = now + max(0.0, wait)
+        if wait > 0:
+            time.sleep(wait)                    # 锁外睡眠
+
         # 熔断冷却：连续失败过多时全局暂停，等待风控解除
         while True:
             with self._lock:
                 remaining = self._cooldown_until - time.monotonic()
+                now = time.monotonic()
+                should_log = now - self._last_cooldown_log >= 15.0
+                if remaining > 0 and should_log:
+                    self._last_cooldown_log = now
             if remaining <= 0:
                 return
-            # 多个工作线程会同时等待冷却，这里做日志节流避免刷屏
-            now = time.monotonic()
-            with self._lock:
-                should_log = now - self._last_cooldown_log >= 15.0
-                if should_log:
-                    self._last_cooldown_log = now
             if should_log:
                 logger.warning("熔断冷却中，剩余 %.1fs（等待风控解除）", remaining)
-            time.sleep(min(remaining, 5.0))
+            time.sleep(min(remaining, 5.0))     # 锁外睡眠
 
     def _record_success(self) -> None:
         """记录一次成功请求，清零连续失败计数。"""
