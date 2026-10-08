@@ -34,7 +34,11 @@ class DummyResponse:
 
 
 class DummySession:
-    """按顺序返回预设响应的 Session 替身，并记录调用次数。"""
+    """按顺序返回预设响应的 Session 替身，并记录调用次数。
+
+    需要同时支持 prepare_request + send 两个方法，因为客户端为避免
+    并发持锁而改用「先准备请求、再在锁外发送」的方式。
+    """
 
     def __init__(self, responses) -> None:
         self._responses = list(responses)
@@ -42,8 +46,20 @@ class DummySession:
         self.headers = {}
         self.cookies = _DummyCookies()
 
-    def get(self, url, params=None, timeout=None):  # noqa: D401
+    def prepare_request(self, request):  # noqa: D401
+        """返回请求本身（替身无需真正准备）。"""
+        return request
+
+    def send(self, request, timeout=None, **kwargs):  # noqa: D401
         """返回下一个预设响应。"""
+        return self._next()
+
+    def get(self, url, params=None, timeout=None):  # noqa: D401
+        """兼容直接调用 get 的场景。"""
+        return self._next()
+
+    def _next(self):
+        """取下一个预设响应，耗尽则抛连接异常。"""
         self.calls += 1
         if not self._responses:
             raise requests.ConnectionError("没有更多预设响应")
@@ -68,8 +84,11 @@ class _DummyCookies:
 
 
 def make_client(**kwargs) -> BiliClient:
-    """构造一个不发请求的客户端（delay 设为 0 加速测试）。"""
-    return BiliClient(delay_range=(0, 0), max_retries=2, **kwargs)
+    """构造一个不发请求的客户端（delay 与全局节流都置 0 以加速测试）。"""
+    kwargs.setdefault("delay_range", (0, 0))
+    kwargs.setdefault("max_retries", 2)
+    kwargs.setdefault("min_interval", 0.0)
+    return BiliClient(**kwargs)
 
 
 def make_signed_client(key: str) -> BiliClient:

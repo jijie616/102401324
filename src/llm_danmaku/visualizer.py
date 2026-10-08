@@ -233,6 +233,7 @@ def make_sentiment_pie(stats: DanmakuStats) -> Optional[Path]:
 def make_progress_chart(stats: DanmakuStats) -> Optional[Path]:
     """弹幕在视频时间轴上的分布折线图（判断"哪个环节最受关注"）。"""
     if not stats.progress_buckets:
+        logger.warning("时间分布数据为空，跳过时间轴图表")
         return None
     _apply_style()
     labels = [k for k, _ in stats.progress_buckets]

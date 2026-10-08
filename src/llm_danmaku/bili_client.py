@@ -64,16 +64,37 @@ class BiliClient:
         max_retries: int = config.MAX_RETRIES,
         timeout: int = config.REQUEST_TIMEOUT,
         session: Optional[requests.Session] = None,
+        min_interval: float = config.MIN_REQUEST_INTERVAL,
     ) -> None:
         self.delay_range = delay_range
         self.max_retries = max_retries
         self.timeout = timeout
-        self._lock = threading.Lock()
         self._wbi_key: Optional[str] = None
         self._wbi_key_ts = 0.0
+        self._lock = threading.Lock()          # 保护 wbi key / Session 字典 / 令牌桶
+        self._sessdata = (sessdata if sessdata is not None else config.SESSDATA).strip()
 
-        self.session = session or requests.Session()
-        self.session.headers.update(
+        # 全局令牌桶与熔断状态
+        self._min_interval = max(0.0, float(min_interval))
+        self._last_request_ts = 0.0
+        self._consecutive_failures = 0
+        self._cooldown_until = 0.0
+        self._cooldown_seconds = 0.0      # 当前冷却时长，触发熔断时按倍数增长
+        self._last_cooldown_log = 0.0     # 冷却日志节流用
+
+        # 线程专属 Session 字典：requests.Session 的 CookieJar 在并发写时不是线程安全的，
+        # 每个抓取线程各持一个 Session 才能真正并发。
+        # 若外部显式传入 session（单元测试注入替身），则所有线程共用它。
+        self._external_session = session
+        self._sessions: Dict[int, requests.Session] = {}
+        if session is not None:
+            self._configure(session)
+
+    # ---------------------------------------------------------------- 会话管理
+    @staticmethod
+    def _configure(session: requests.Session) -> None:
+        """给 Session 套用统一请求头。"""
+        session.headers.update(
             {
                 "User-Agent": config.USER_AGENT,
                 "Referer": "https://www.bilibili.com/",
@@ -81,10 +102,60 @@ class BiliClient:
                 "Accept-Language": "zh-CN,zh;q=0.9",
             }
         )
-        token = (sessdata if sessdata is not None else config.SESSDATA)
-        if token:
-            self.session.cookies.set("SESSDATA", token, domain=".bilibili.com")
-            logger.info("已注入 SESSDATA，可获取更完整的弹幕数据")
+
+    def _build_session(self) -> requests.Session:
+        """新建一个已配置好的 Session（含 SESSDATA 注入）。"""
+        session = requests.Session()
+        self._configure(session)
+        if self._sessdata:
+            session.cookies.set("SESSDATA", self._sessdata, domain=".bilibili.com")
+        return session
+
+    def _thread_session(self) -> requests.Session:
+        """取当前线程专属的 Session。
+
+        实现要点：**Session 的创建绝不能放在锁内**。
+        ``requests.Session()`` 首次构造会初始化 SSL 上下文与证书校验，
+        耗时可达数百毫秒；若在持锁期间构造，6 个抓取线程会串行排队等待，
+        表现就是"所有线程都卡在取 Session 上、几分钟没有任何产出"。
+
+        因此采用双重检查：锁内只做字典查找，未命中则**出锁构造**，再入锁登记。
+        requests.Session 的 CookieJar 不是并发安全的，所以每个线程必须独立持有。
+        """
+        if self._external_session is not None:
+            return self._external_session
+
+        ident = threading.get_ident()
+        with self._lock:                       # 临界区仅一次字典查找
+            session = self._sessions.get(ident)
+        if session is not None:
+            return session
+
+        session = self._build_session()        # 出锁构造（SSL 初始化在这里完成）
+
+        with self._lock:                       # 二次检查 + 登记
+            existing = self._sessions.get(ident)
+            if existing is not None:
+                session.close()
+                return existing
+            self._sessions[ident] = session
+        return session
+
+    @property
+    def session(self) -> requests.Session:
+        """当前线程的 Session（对外保留该属性名以兼容调用方与测试）。"""
+        return self._thread_session()
+
+    def close(self) -> None:
+        """释放本客户端创建的所有连接池。"""
+        with self._lock:
+            sessions = list(self._sessions.values())
+            self._sessions.clear()
+        for session in sessions:
+            try:
+                session.close()
+            except Exception as exc:  # noqa: BLE001 - 关闭失败不应影响退出
+                logger.debug("Session 关闭异常：%s", exc)
 
     # ---------------------------------------------------------------- 基础请求
     def _sleep(self) -> None:
@@ -92,6 +163,57 @@ class BiliClient:
         low, high = self.delay_range
         if high > 0:
             time.sleep(random.uniform(low, high))
+
+    def _throttle(self) -> None:
+        """进程级令牌桶：保证任意两次请求之间至少间隔 MIN_REQUEST_INTERVAL。
+
+        这是**全局**节流（跨线程共享），因此把并发调高也不会突破总速率上限。
+        实测：无节流时 6 线程短时间打出数千请求会触发 B 站突发限流，
+        接口连续失败直至冷却；加入全局节流后可持续稳定抓取。
+        """
+        with self._lock:
+            now = time.monotonic()
+            wait = self._min_interval - (now - self._last_request_ts)
+            if wait > 0:
+                time.sleep(wait)
+            self._last_request_ts = time.monotonic()
+        # 熔断冷却：连续失败过多时全局暂停，等待风控解除
+        while True:
+            with self._lock:
+                remaining = self._cooldown_until - time.monotonic()
+            if remaining <= 0:
+                return
+            # 多个工作线程会同时等待冷却，这里做日志节流避免刷屏
+            now = time.monotonic()
+            with self._lock:
+                should_log = now - self._last_cooldown_log >= 15.0
+                if should_log:
+                    self._last_cooldown_log = now
+            if should_log:
+                logger.warning("熔断冷却中，剩余 %.1fs（等待风控解除）", remaining)
+            time.sleep(min(remaining, 5.0))
+
+    def _record_success(self) -> None:
+        """记录一次成功请求，清零连续失败计数。"""
+        with self._lock:
+            self._consecutive_failures = 0
+
+    def _record_failure(self, reason: str) -> None:
+        """记录一次失败；连续失败超阈值则进入冷却（熔断，冷却时长指数增长）。"""
+        with self._lock:
+            self._consecutive_failures += 1
+            if (self._consecutive_failures >= config.CIRCUIT_FAIL_THRESHOLD
+                    and time.monotonic() >= self._cooldown_until):
+                self._cooldown_seconds = min(
+                    config.CIRCUIT_COOLDOWN_MAX,
+                    max(config.CIRCUIT_COOLDOWN,
+                        self._cooldown_seconds * config.CIRCUIT_COOLDOWN_FACTOR),
+                )
+                self._cooldown_until = time.monotonic() + self._cooldown_seconds
+                logger.warning("连续失败 %d 次（%s），触发熔断，冷却 %.0fs",
+                               self._consecutive_failures, reason,
+                               self._cooldown_seconds)
+                self._consecutive_failures = 0
 
     def get(
         self,
@@ -101,7 +223,11 @@ class BiliClient:
         binary: bool = False,
         retries: Optional[int] = None,
     ) -> Any:
-        """GET 请求，自动重试。
+        """GET 请求，自动重试 + 全局节流 + 熔断保护。
+
+        **线程安全说明**：锁只用于令牌桶计数与字典查找（微秒级），
+        绝不能在持锁期间做网络等待，也不能在锁内再调用会取同一把锁的方法
+        （``threading.Lock`` 不可重入，会直接自死锁）。
 
         Args:
             url: 目标地址。
@@ -117,19 +243,23 @@ class BiliClient:
         """
         attempts = self.max_retries if retries is None else retries
         last_error: Optional[Exception] = None
+        # 只取一次 Session（_thread_session 内部自带锁，这里绝不能再套一层）
+        session = self._thread_session()
 
         for attempt in range(1, attempts + 1):
             self._sleep()
+            self._throttle()
             try:
-                with self._lock:
-                    resp = self.session.get(url, params=params, timeout=self.timeout)
+                resp = session.get(url, params=params, timeout=self.timeout)
                 if resp.status_code == 412:
                     # 412 是 B 站的风控信号，必须显著退避
                     wait = config.BACKOFF_BASE ** (attempt + 2)
                     logger.warning("触发风控 412，退避 %.1fs 后重试（第 %d 次）", wait, attempt)
+                    self._record_failure("HTTP 412")
                     time.sleep(wait)
                     continue
                 resp.raise_for_status()
+                self._record_success()
                 if binary:
                     return resp.content
                 return resp.json()
@@ -137,6 +267,7 @@ class BiliClient:
                 last_error = exc
                 wait = config.BACKOFF_BASE ** attempt
                 logger.debug("请求失败(%s)，%.1fs 后重试：%s", type(exc).__name__, wait, exc)
+                self._record_failure(type(exc).__name__)
                 time.sleep(wait)
 
         raise requests.RequestException(
@@ -208,10 +339,6 @@ class BiliClient:
         )
         signed["w_rid"] = hashlib.md5((query + self.wbi_key()).encode()).hexdigest()
         return signed
-
-    def close(self) -> None:
-        """释放连接池。"""
-        self.session.close()
 
     def __enter__(self) -> "BiliClient":
         return self

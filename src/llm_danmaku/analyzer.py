@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from . import config
-from .cleaner import CleanReport
+from .cleaner import CleanReport, clean_batch
 from .danmaku_crawler import CrawlResult, Danmaku
 from .tokenizer import drop_substring_words, tokenize_batch
 
@@ -156,23 +156,30 @@ def count_hits(texts: Sequence[str], keywords: Sequence[str]) -> int:
     return sum(1 for t in lowered if any(k in t for k in keys))
 
 
-def _progress_bucket(progress_ms: int) -> str:
+def _progress_bucket(progress_ms: int, duration_ms: int = 0) -> str:
     """把弹幕时间点映射到占视频总长 1/10 的区间标签。
 
-    这里以 60 分钟作为"典型长视频"的归一化基准：每 6 分钟为一个桶，
-    共 10 个桶（0-10% … 90-100%），与 B 站 6 分钟一包的弹幕协议同粒度。
+    优先使用**该视频的真实总时长**做百分比换算（多分P 视频的 progress
+    已由爬虫按分P 时长做了偏移归一化，两者配合才能得到正确的相对位置）。
+    若时长未知，则退化为以 60 分钟为基准、每 6 分钟一个桶的固定分桶。
 
     Examples:
         >>> _progress_bucket(0)
         '0-10%'
-        >>> _progress_bucket(6 * 60 * 1000)
+        >>> _progress_bucket(30_000, duration_ms=300_000)
         '10-20%'
     """
     try:
-        seconds = max(0.0, float(progress_ms) / 1000.0)
+        progress = max(0.0, float(progress_ms))
+        duration = float(duration_ms or 0)
     except (TypeError, ValueError):
-        seconds = 0.0
-    bucket = min(9, int(seconds // 360))          # 每桶 360 秒 = 6 分钟
+        return "0-10%"
+
+    if duration > 0:
+        ratio = min(0.999999, progress / duration)
+        bucket = int(ratio * 10)
+    else:
+        bucket = min(9, int(progress / 1000 // 360))      # 每桶 360 秒 = 6 分钟
     low = bucket * 10
     return f"{low}-{low + 10}%"
 
@@ -186,9 +193,19 @@ def analyze(
 ) -> DanmakuStats:
     """对抓取结果与清洗结果做全量统计。
 
+    **关于去重口径（关键设计决策）**
+    本项目采用「**视频内去重、跨视频计数**」：
+      - 同一个视频里重复刷屏的弹幕只算一次（避免一个复读机用户污染词频）；
+      - 但同一条弹幕出现在 N 个不同视频里要计 N 次。
+
+    为什么不能做全局去重：弹幕是高度长尾的自由文本，跨视频几乎不重复。
+    早期版本做了全局去重，结果 Top8 弹幕全部是"出现 1 次"，排名失去意义。
+    改成跨视频计数后，「幻觉就是这样产生的」这类被大量视频反复提及的观点
+    才会自然浮到榜首，这才是作业要的"数量排名前 8 的弹幕"。
+
     Args:
         results: 每个视频的抓取结果。
-        cleaned_texts: 全量清洗后的弹幕文本。
+        cleaned_texts: 全量清洗后的弹幕文本（用于词频与主题统计）。
         report: 清洗报告（可选，用于填充数据质量指标）。
         top_comment_n: Top 弹幕取前几名（作业要求 8）。
         top_word_n: 词频榜长度。
@@ -205,53 +222,63 @@ def analyze(
         generated_at=datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
 
-    # ---------- 1. 每个视频的"每类弹幕"统计（一次遍历） ----------
+    # ---------- 1. 每个视频的"每类弹幕"统计 ----------
+    # 视频内去重，但把去重前的条数单独记下来（用于数据质量说明）
     video_stats: List[VideoStat] = []
+    global_counter: Counter = Counter()          # 跨视频累计（视频内已去重）
+    global_llm_counter: Counter = Counter()
+    llm_words = tuple(w.lower() for w in config.LLM_TOPIC_WORDS)
+    all_cleaned: List[str] = []                  # 视频内去重后的全部弹幕
+
     for idx, res in enumerate(result_list, start=1):
         raw_texts = [dm.text for dm in res.danmaku]
-        counter = Counter(t for t in raw_texts if t.strip())
-        video = res.danmaku
+        kept, _ = clean_batch(raw_texts, deduplicate=True)
+        counter = Counter(kept)
+
         video_stats.append(
             VideoStat(
                 rank=idx, bvid=res.bvid, title=res.title,
-                raw_count=len(video),
-                cleaned_count=len(counter),
+                raw_count=len(raw_texts),        # 该视频抓到的原始弹幕数
+                cleaned_count=sum(counter.values()),
                 unique_count=len(counter),
                 top_comments=counter.most_common(top_comment_n),
             )
         )
-        stats.total_raw += len(video)
-    stats.video_stats = video_stats
-    stats.total_cleaned = len(cleaned_texts)
+        stats.total_raw += len(raw_texts)
 
-    # ---------- 2. 全局 Top 弹幕 ----------
-    global_counter = Counter(cleaned_texts)
+        # 跨视频累计：每条弹幕在每个视频里只贡献一次
+        global_counter.update(counter.keys())
+        all_cleaned.extend(counter.keys())
+        global_llm_counter.update(
+            t for t in counter if any(w in t.lower() for w in llm_words)
+        )
+
+    stats.video_stats = video_stats
+
+    # ---------- 2. 全局 Top 弹幕（跨视频出现次数） ----------
+    stats.total_cleaned = len(all_cleaned)
     stats.total_unique = len(global_counter)
     stats.top_comments = global_counter.most_common(top_comment_n)
+    stats.top_llm_comments = global_llm_counter.most_common(top_comment_n)
 
-    # ---------- 3. 与 LLM 应用强相关的弹幕 Top-N ----------
-    llm_words = tuple(w.lower() for w in config.LLM_TOPIC_WORDS)
-    llm_counter = Counter(
-        t for t in cleaned_texts if any(w in t.lower() for w in llm_words)
-    )
-    stats.top_llm_comments = llm_counter.most_common(top_comment_n)
+    # ---------- 3. 复读机式刷屏（视频内的高频重复） ----------
+    repeated: Counter = Counter()
+    for res in result_list:
+        counter = Counter(dm.text.strip() for dm in res.danmaku if dm.text.strip())
+        for text, count in counter.items():
+            if count > 1:
+                repeated[text] = max(repeated[text], count)
+    stats.repeated_comments = repeated.most_common(15)
 
-    # ---------- 4. 复读机式刷屏（清洗前的高频重复） ----------
-    raw_counter = Counter(
-        dm.text.strip() for res in result_list for dm in res.danmaku if dm.text.strip()
-    )
-    stats.repeated_comments = [(t, c) for t, c in raw_counter.most_common(15) if c > 1]
-
-    # ---------- 5. 领域 / 成本 / 风险 / 情感（多路一次遍历） ----------
+    # ---------- 4. 领域 / 成本 / 风险 / 情感（多路一次遍历） ----------
     domain_counts: Dict[str, int] = defaultdict(int)
-    progress_counter: Counter = Counter()
     pos = neg = neu = 0
     domain_items = [(d, tuple(w.lower() for w in ws)) for d, ws in DOMAIN_KEYWORDS.items()]
     cost_keys = tuple(k.lower() for k in COST_KEYWORDS)
     risk_keys = tuple(k.lower() for k in RISK_KEYWORDS)
     benefit_keys = tuple(k.lower() for k in BENEFIT_KEYWORDS)
 
-    for text in cleaned_texts:
+    for text in all_cleaned:
         lowered = text.lower()
         for domain, words in domain_items:
             if any(w in lowered for w in words):
@@ -275,18 +302,19 @@ def analyze(
     stats.domain_counts = dict(domain_counts)
     stats.positive_count, stats.negative_count, stats.neutral_count = pos, neg, neu
 
-    # ---------- 6. 弹幕在视频时间轴上的分布 ----------
+    # ---------- 5. 弹幕在视频时间轴上的分布 ----------
+    progress_counter: Counter = Counter()
     for res in result_list:
         for dm in res.danmaku:
-            progress_counter[_progress_bucket(dm.progress)] += 1
+            progress_counter[_progress_bucket(dm.progress, res.duration_ms)] += 1
     stats.progress_buckets = sorted(
         progress_counter.items(), key=lambda kv: int(kv[0].split("-")[0])
     )
 
-    # ---------- 7. 词频（分词一次性完成） ----------
+    # ---------- 6. 词频（分词一次性完成） ----------
     # 先按子串去重（"大模型"/"模型" 只保留更有信息量的那个），再取 Top-N，
     # 避免词云与词频榜出现语义重复的条目。
-    words = tokenize_batch(cleaned_texts)
+    words = tokenize_batch(all_cleaned)
     word_counts = drop_substring_words(dict(Counter(words)))
     stats.top_words = Counter(word_counts).most_common(top_word_n)
 
@@ -294,7 +322,8 @@ def analyze(
         stats.clean_report = report.as_dict()
 
     logger.info(
-        "统计完成：视频 %d 个，原始弹幕 %d 条，清洗后 %d 条，唯一 %d 条，词汇 %d 个",
+        "统计完成：视频 %d 个，原始弹幕 %d 条，视频内去重后 %d 条，"
+        "跨视频唯一文本 %d 种，词汇 %d 个",
         stats.video_count, stats.total_raw, stats.total_cleaned,
         stats.total_unique, len(words),
     )

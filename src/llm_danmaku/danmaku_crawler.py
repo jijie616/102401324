@@ -16,6 +16,7 @@ import logging
 import re
 import struct
 import threading
+import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass, field
@@ -68,6 +69,7 @@ class CrawlResult:
     source: str = "cache"   # cache / xml / proto
     ok: bool = True
     error: str = ""
+    duration_ms: int = 0    # 整部视频总时长（毫秒），用于时间轴百分比归一化
 
     @property
     def count(self) -> int:
@@ -229,15 +231,21 @@ class DanmakuCrawler:
     def __init__(
         self,
         client: BiliClient,
-        raw_dir: Path = config.RAW_DIR,
-        workers: int = config.CRAWL_WORKERS,
+        raw_dir: Optional[Path] = None,
+        workers: Optional[int] = None,
         use_proto: bool = True,
+        max_pages: Optional[int] = None,
+        time_budget: Optional[float] = None,
     ) -> None:
         self.client = client
-        self.raw_dir = Path(raw_dir)
+        self.raw_dir = Path(raw_dir) if raw_dir is not None else config.RAW_DIR
         self.raw_dir.mkdir(parents=True, exist_ok=True)
-        self.workers = max(1, workers)
+        self.workers = max(1, workers if workers is not None else config.CRAWL_WORKERS)
         self.use_proto = use_proto
+        self.max_pages = max(1, max_pages if max_pages is not None
+                             else config.MAX_PAGES_PER_VIDEO)
+        self.time_budget = float(time_budget if time_budget is not None
+                                 else config.VIDEO_TIME_BUDGET)
         self.failed_log = self.raw_dir / "failed.log"
 
         # XML 接口单视频上限约 1000 条（实测 maxlimit=1000，返回可达 1200）。
@@ -249,6 +257,7 @@ class DanmakuCrawler:
         self._proto_forced = False
         self._proto_disabled = False
         self.stats = {"xml_only": 0, "proto_used": 0, "proto_skipped": 0}
+        self._page_durations: Dict[str, List[int]] = {}   # bvid -> 各分P 时长（秒）
 
     # ------------------------------------------------------------ 单视频
     def fetch_cid(self, bvid: str) -> Tuple[int, List[int], str]:
@@ -257,9 +266,12 @@ class DanmakuCrawler:
         依次尝试三个接口（2025 年实测：view 接口对匿名请求返回 412 被封，
         player/pagelist 是最稳的替代）：
 
-        1. ``x/player/pagelist`` —— 返回 [{cid, part, page}, ...]，**首选**
+        1. ``x/player/pagelist`` —— 返回 [{cid, part, page, duration}, ...]，**首选**
         2. ``x/player/v2``       —— 返回 {cid, aid, bvid, ...}，备用
         3. ``x/web-interface/view`` —— 仅在上述都失败时兜底
+
+        副作用：把各分P 的时长缓存到 ``self._page_durations[bvid]``，
+        供多分P 弹幕进度归一化使用。
 
         Returns:
             (首个 cid, 全部分P cid 列表, 视频标题)
@@ -274,6 +286,10 @@ class DanmakuCrawler:
                 if cids:
                     # 单P 时 part 就是视频标题；多P 时取第一分P 名
                     title = str(data[0].get("part") or "")
+                    with self._lock:
+                        self._page_durations[bvid] = [
+                            int(p.get("duration") or 0) for p in data
+                        ]
                     return cids[0], cids, title
             errors.append("pagelist 返回空列表")
         except Exception as exc:  # noqa: BLE001 - 逐个降级尝试
@@ -294,12 +310,23 @@ class DanmakuCrawler:
             data = self.client.get_json(API_VIEW, {"bvid": bvid})
             pages = data.get("pages") or []
             cids = [int(p["cid"]) for p in pages if p.get("cid")] or [int(data["cid"])]
+            with self._lock:
+                self._page_durations[bvid] = [int(p.get("duration") or 0)
+                                              for p in pages] or []
             return cids[0], cids, str(data.get("title") or "")
         except Exception as exc:  # noqa: BLE001
             errors.append(f"view: {exc}")
 
         raise BiliApiError(-1, f"三个接口均未能取得 {bvid} 的 cid；" + " | ".join(errors),
                            API_PAGELIST)
+
+    def _page_duration(self, bvid: str, page_index: int) -> int:
+        """取某分P 的时长（秒）；未知时返回 0。"""
+        with self._lock:
+            durations = self._page_durations.get(bvid) or []
+        if 1 <= page_index <= len(durations):
+            return int(durations[page_index - 1] or 0)
+        return 0
 
     def fetch_xml(self, cid: int) -> List[Danmaku]:
         """用 XML 接口抓取一个 cid 的弹幕（约上限 1000~1200 条）。"""
@@ -335,12 +362,28 @@ class DanmakuCrawler:
 
         result = CrawlResult(bvid=video.bvid, title=video.title)
         try:
+            deadline = time.monotonic() + self.time_budget
             cid, cids, title = self.fetch_cid(video.bvid)
             result.cid, result.title = cid, title or video.title
 
+            # 限制分P 数量：搜索结果里有大量「合集课」（60~100 个分P），
+            # 全量遍历会让单视频耗时放大到几百秒，把线程池全部占死。
+            total_pages = len(cids)
+            pages = cids[:self.max_pages]
+            if total_pages > self.max_pages:
+                logger.debug("%s 共 %d 个分P，按配置只抓前 %d 个",
+                             video.bvid, total_pages, self.max_pages)
+
             all_danmaku: List[Danmaku] = []
             source = "xml"
-            for idx, one_cid in enumerate(cids, start=1):
+            total_duration = 0
+            for idx, one_cid in enumerate(pages, start=1):
+                # 时间预算硬保护：单个视频异常缓慢时立刻收手，
+                # 保存已抓到的部分，绝不让工作线程被长期占死。
+                if time.monotonic() > deadline:
+                    logger.warning("%s 超出单视频时间预算 %.0fs，已抓 %d 个分P，提前结束",
+                                   video.bvid, self.time_budget, idx - 1)
+                    break
                 batch = self.fetch_xml(one_cid)
                 need_proto = (
                     self.use_proto
@@ -354,17 +397,42 @@ class DanmakuCrawler:
                         self._record_proto(used=True)
                     else:
                         self._record_proto(used=False)
+
+                # 多分P 的 progress 是"分P 内偏移"，直接统计会让所有分P 的
+                # 弹幕都堆在 0-10% 桶里。这里按分P 时长做偏移归一化，
+                # 换算成"在整部视频中的相对位置"，时间轴统计才有意义。
+                page_duration = self._page_duration(cids, idx)
+                if page_duration:
+                    total_duration += page_duration
+                    for dm in batch:
+                        dm.progress = int(dm.progress) + (total_duration - page_duration) * 1000
+
                 all_danmaku.extend(batch)
                 logger.debug("%s 分P%d/%d 抓到 %d 条（%s）",
-                             video.bvid, idx, len(cids), len(batch), source)
+                             video.bvid, idx, len(pages), len(batch), source)
+
+            # 记录整部视频总时长（毫秒），供时间轴百分比换算使用
+            duration_ms = total_duration * 1000
 
             self._dedupe_inplace(all_danmaku)
             result.danmaku = all_danmaku
             result.source = source
+            result.duration_ms = duration_ms
+
+            # 数据保护：重新抓取（force）时若一个分P 都没抓到，而本地已有非空缓存，
+            # 则保留原缓存。否则一次网络抖动就会把辛苦抓来的数据覆盖成空文件。
+            if not all_danmaku and cache.exists() and not force:
+                cached = self._load_cache(cache)
+                if cached is not None and cached.count > 0:
+                    logger.warning("%s 本次未抓到弹幕，保留已有缓存（%d 条）",
+                                   video.bvid, cached.count)
+                    return cached
             self._save_cache(cache, result)
         except Exception as exc:  # noqa: BLE001 - 单视频失败需隔离
-            result.ok, result.error = False, f"{type(exc).__name__}: {exc}"
+            result.ok = False
+            result.error = f"{type(exc).__name__}: {exc}"
             logger.warning("视频 %s 抓取失败：%s", video.bvid, result.error)
+            logger.debug("失败详情", exc_info=True)      # -v 时可看到完整栈
             with open(self.failed_log, "a", encoding="utf-8") as fh:
                 fh.write(f"{video.bvid}\t{result.title}\t{result.error}\n")
         return result
@@ -454,6 +522,7 @@ class DanmakuCrawler:
             meta = {
                 "bvid": result.bvid, "title": result.title, "cid": result.cid,
                 "source": result.source, "count": result.count,
+                "duration_ms": result.duration_ms,
             }
             fh.write(json.dumps(meta, ensure_ascii=False) + "\n")
             for dm in result.danmaku:
@@ -461,20 +530,37 @@ class DanmakuCrawler:
         tmp.replace(path)     # 原子替换，避免中断产生半截文件
 
     def _load_cache(self, path: Path) -> Optional[CrawlResult]:
-        """读取缓存；文件损坏时返回 None 以便重新抓取。"""
+        """读取缓存；文件损坏时返回 None 以便重新抓取。
+
+        注意：必须按 Danmaku 的字段白名单过滤，不能直接 ``Danmaku(**json.loads(line))``。
+        早期版本直接展开字典，遇到元信息里的 list 字段（如 dimension）
+        会抛 ``TypeError: unhashable type: 'list'``，而该异常被 crawl_video 的
+        兜底捕获后会把视频判为失败并覆盖缓存，导致整批数据丢失。
+        """
         try:
             with open(path, "r", encoding="utf-8") as fh:
                 first = fh.readline()
                 if not first:
                     return None
                 meta = json.loads(first)
-                danmaku = [Danmaku(**json.loads(line)) for line in fh if line.strip()]
+                allowed = Danmaku.__dataclass_fields__.keys()
+                danmaku: List[Danmaku] = []
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    raw = json.loads(line)
+                    if not isinstance(raw, dict) or "text" not in raw:
+                        continue
+                    danmaku.append(Danmaku(**{k: v for k, v in raw.items()
+                                              if k in allowed}))
             return CrawlResult(
                 bvid=meta.get("bvid", path.stem), title=meta.get("title", ""),
                 cid=int(meta.get("cid") or 0), danmaku=danmaku,
                 source="cache", ok=True,
+                duration_ms=int(meta.get("duration_ms") or 0),
             )
-        except (OSError, json.JSONDecodeError, TypeError) as exc:
+        except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
             logger.warning("缓存 %s 读取失败，将重新抓取：%s", path.name, exc)
             return None
 
